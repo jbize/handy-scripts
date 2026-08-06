@@ -2,7 +2,13 @@
 
 Personal one-off scripts and small utilities (Python, shell, etc.).
 
-Private toolkit repo — not an installable package. Run scripts directly from this tree (or via symlinks from `~/bin`).
+Not an installable package — run scripts from a clone, or fetch a single file:
+
+```bash
+wget -O upgrade_to_trixie.sh \
+  https://raw.githubusercontent.com/jbize/handy-scripts/main/shell/upgrade_to_trixie.sh
+chmod +x upgrade_to_trixie.sh
+```
 
 ## Layout
 
@@ -13,5 +19,5 @@ Private toolkit repo — not an installable package. Run scripts directly from t
 
 | Script | Notes |
 | --- | --- |
-| `python/billing_assistant.pyw` | Billing helper (Windows `.pyw`-friendly) |
-| `shell/upgrade_to_trixie.sh` | Debian 12 → 13 upgrade helper |
+| `python/billing_assistant.pyw` | Billing helper (Windows `.pyw`-friendly). Reads invoice details from a local Excel workbook; no secrets in-repo. |
+| `shell/upgrade_to_trixie.sh` | Debian 12 → 13 one-shot. Ends with `autoremove`/`autoclean` and a leftover report. Later: `sudo ./upgrade_to_trixie.sh --cleanup-only --yes` removes apt `*.bak` and purges `rc` packages; flags `.dpkg-old`/`.dpkg-dist`. |
