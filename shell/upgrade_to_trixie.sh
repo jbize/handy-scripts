@@ -17,22 +17,30 @@ MIN_FREE_GIB=4
 CHECK_ONLY=0
 CLEANUP_ONLY=0
 ASSUME_YES=0
+# Seconds to wait after preflight before live mutations (--yes). Ctrl-C aborts.
+COLD_FEET_SECS=15
+SKIP_COLD_FEET=0
 
 usage() {
   cat <<'EOF'
 Debian 12 (Bookworm) → 13 (Trixie). One-shot, fail-closed.
 
+Default (no flags): preflight only — no system changes.
+Mutations require an affirmative flag.
+
 Typical server use:
-  sudo ./upgrade_to_trixie.sh --check-only   # optional dry preflight
-  sudo ./upgrade_to_trixie.sh --yes          # upgrade + package cleanup
+  sudo ./upgrade_to_trixie.sh                # preflight / dry prove-out
+  sudo ./upgrade_to_trixie.sh --yes          # upgrade after preflight + cold-feet pause
   sudo reboot
   # a few days later, when you no longer need apt-source rollback:
   sudo ./upgrade_to_trixie.sh --cleanup-only --yes
 
-  --check-only     Preflight only (proves rewritten apt sources); no changes.
-  --cleanup-only   Later pass: remove this script's apt *.bak backups; with --yes
-                   also purge leftover rc packages. Always flags .dpkg-old/.dpkg-dist.
-  --yes            Noninteractive. Recommended on remote servers.
+  --yes            Affirmative: perform the upgrade (or cleanup deletions with
+                   --cleanup-only). Required for any live changes.
+  --now            Skip the post-preflight cold-feet countdown (with --yes).
+  --check-only     Same as default: preflight only (explicit alias).
+  --cleanup-only   Later pass: with --yes, remove this script's apt *.bak and
+                   purge rc packages. Always flags .dpkg-old/.dpkg-dist.
 EOF
 }
 
@@ -41,6 +49,7 @@ while [[ $# -gt 0 ]]; do
     --check-only) CHECK_ONLY=1 ;;
     --cleanup-only) CLEANUP_ONLY=1 ;;
     --yes|-y) ASSUME_YES=1 ;;
+    --now) SKIP_COLD_FEET=1 ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "ERROR: Unknown option: $1" >&2
@@ -151,7 +160,12 @@ verify_planned_apt_update() {
 preflight() {
   local free_kib free_gib held audit_out
 
-  echo "=== Preflight: refuse to mutate if a mid-upgrade failure looks likely ==="
+  echo
+  echo "######################################################################"
+  echo "# PHASE: PREFLIGHT (read-only — no suite change, no package upgrade) #"
+  echo "######################################################################"
+  echo "Refuse to mutate if a mid-upgrade failure looks likely."
+  echo
 
   if [[ $EUID -ne 0 ]]; then
     die "Must run as root (use: sudo $0). Preflight needs root for apt/dpkg checks."
@@ -210,7 +224,87 @@ preflight() {
   # Critical safety gate: prove rewritten repos (Docker→trixie, etc.) work first.
   verify_planned_apt_update
 
-  echo "Preflight passed."
+  echo
+  echo "######################################################################"
+  echo "# PHASE: PREFLIGHT COMPLETE — system not modified                    #"
+  echo "######################################################################"
+}
+
+# Pause after successful preflight so an operator can Ctrl-C before mutations.
+cold_feet_pause() {
+  local secs="$COLD_FEET_SECS" i
+  if (( SKIP_COLD_FEET )); then
+    echo "Cold-feet pause skipped (--now)."
+    return 0
+  fi
+  echo
+  echo "######################################################################"
+  echo "# COLD FEET: live upgrade starts in ${secs}s — Ctrl-C to abort        #"
+  echo "######################################################################"
+  echo "After this pause the script will rewrite apt sources and upgrade packages."
+  for ((i = secs; i >= 1; i--)); do
+    printf '\r  Starting live upgrade in %2d second(s)... (Ctrl-C to abort) ' "$i"
+    sleep 1
+  done
+  printf '\r  Starting live upgrade now.                                          \n'
+  echo
+}
+
+run_upgrade() {
+  export DEBIAN_FRONTEND=noninteractive
+
+  echo "######################################################################"
+  echo "# PHASE: LIVE UPGRADE — system WILL be modified                      #"
+  echo "# Debian ${SOURCE_CODENAME} → ${TARGET_CODENAME}                                       #"
+  echo "######################################################################"
+  echo
+
+  echo "Step 1: Backing up APT source lists..."
+  backup_file /etc/apt/sources.list
+  if [[ -d /etc/apt/sources.list.d ]]; then
+    local f
+    shopt -s nullglob
+    for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+      backup_file "$f"
+    done
+    shopt -u nullglob
+  fi
+
+  echo "Step 2: Rewriting Bookworm/Debian_12 tokens to ${TARGET_CODENAME}/Debian_13 in apt sources..."
+  apply_rewrites_to_live_tree
+
+  echo "Step 3: apt-get update..."
+  apt-get update
+
+  echo "Step 4: minimal upgrade (apt-get upgrade --without-new-pkgs)..."
+  apt-get \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold" \
+    upgrade --without-new-pkgs -y
+
+  echo "Step 5: full distribution upgrade (apt-get full-upgrade)..."
+  apt-get \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold" \
+    full-upgrade -y
+
+  echo "Step 6: post-upgrade cleanup (autoremove + autoclean)..."
+  # Drop obsolete kernels/libs left after the suite switch; clear old .deb cache.
+  apt-get autoremove -y
+  apt-get autoclean
+
+  # Confirm apt still healthy after cleanup (fail loud if something broke).
+  apt-get update
+
+  echo
+  echo "######################################################################"
+  echo "# PHASE: LIVE UPGRADE FINISHED                                       #"
+  echo "######################################################################"
+  echo "REBOOT REQUIRED to load the new kernel:"
+  echo "  sudo reboot"
+  echo
+  # Flag anything still sitting around (apt *.bak kept on purpose for a few days).
+  report_leftovers || true
 }
 
 # --- Leftover reporting / later cleanup --------------------------------------
@@ -391,61 +485,6 @@ apply_rewrites_to_live_tree() {
   shopt -u nullglob
 }
 
-run_upgrade() {
-  export DEBIAN_FRONTEND=noninteractive
-
-  echo "----------------------------------------------------------"
-  echo "Debian 12 → 13 upgrade"
-  echo "Target: ${TARGET_CODENAME}"
-  echo "----------------------------------------------------------"
-
-  echo "Step 1: Backing up APT source lists..."
-  backup_file /etc/apt/sources.list
-  if [[ -d /etc/apt/sources.list.d ]]; then
-    local f
-    shopt -s nullglob
-    for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-      backup_file "$f"
-    done
-    shopt -u nullglob
-  fi
-
-  echo "Step 2: Rewriting Bookworm/Debian_12 tokens to ${TARGET_CODENAME}/Debian_13 in apt sources..."
-  apply_rewrites_to_live_tree
-
-  echo "Step 3: apt-get update..."
-  apt-get update
-
-  echo "Step 4: minimal upgrade (apt-get upgrade --without-new-pkgs)..."
-  apt-get \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold" \
-    upgrade --without-new-pkgs -y
-
-  echo "Step 5: full distribution upgrade (apt-get full-upgrade)..."
-  apt-get \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold" \
-    full-upgrade -y
-
-  echo "Step 6: post-upgrade cleanup (autoremove + autoclean)..."
-  # Drop obsolete kernels/libs left after the suite switch; clear old .deb cache.
-  apt-get autoremove -y
-  apt-get autoclean
-
-  # Confirm apt still healthy after cleanup (fail loud if something broke).
-  apt-get update
-
-  echo "----------------------------------------------------------"
-  echo "Upgrade + package cleanup finished."
-  echo "REBOOT REQUIRED to load the new kernel:"
-  echo "  sudo reboot"
-  echo "----------------------------------------------------------"
-  echo
-  # Flag anything still sitting around (apt *.bak kept on purpose for a few days).
-  report_leftovers || true
-}
-
 if (( CLEANUP_ONLY )); then
   run_cleanup_only
   exit 0
@@ -453,9 +492,18 @@ fi
 
 preflight
 
-if (( CHECK_ONLY )); then
-  echo "Check-only mode: no changes made."
+# Default and --check-only: prove-out only. Live upgrade requires --yes.
+if (( CHECK_ONLY || ! ASSUME_YES )); then
+  echo
+  echo "Preflight passed. No changes made."
+  if (( ! ASSUME_YES )); then
+    echo "To perform the upgrade, re-run with the affirmative flag:"
+    echo "  sudo $0 --yes"
+  else
+    echo "Check-only mode (--check-only): upgrade not started."
+  fi
   exit 0
 fi
 
+cold_feet_pause
 run_upgrade

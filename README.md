@@ -20,4 +20,4 @@ chmod +x upgrade_to_trixie.sh
 | Script | Notes |
 | --- | --- |
 | `python/billing_assistant.pyw` | Billing helper (Windows `.pyw`-friendly). Reads invoice details from a local Excel workbook; no secrets in-repo. |
-| `shell/upgrade_to_trixie.sh` | Debian 12 → 13 one-shot. Ends with `autoremove`/`autoclean` and a leftover report. Later: `sudo ./upgrade_to_trixie.sh --cleanup-only --yes` removes apt `*.bak` and purges `rc` packages; flags `.dpkg-old`/`.dpkg-dist`. |
+| `shell/upgrade_to_trixie.sh` | Debian 12 → 13. Default = preflight only; `--yes` required to upgrade (15s cold-feet pause; `--now` skips it). Ends with leftover report. Later: `--cleanup-only --yes`. |
