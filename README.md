@@ -1,23 +1,15 @@
 # handy-scripts
 
-Personal one-off scripts and small utilities (Python, shell, etc.).
+Personal one-off scripts and small utilities.
 
-Not an installable package — run scripts from a clone, or fetch a single file:
+**Layout:** each tool lives in its own directory with a `README.md` (opens under the file list on GitHub).
 
-```bash
-wget -O upgrade_to_trixie.sh \
-  https://raw.githubusercontent.com/jbize/handy-scripts/main/shell/upgrade_to_trixie.sh
-chmod +x upgrade_to_trixie.sh
-```
+No installable package — clone the repo, or fetch a single file from raw GitHub.
 
-## Layout
-
-- `python/` — `.py` / `.pyw` utilities
-- `shell/` — shell scripts
-
-## Contents
-
-| Script | Notes |
+| Tool | Notes |
 | --- | --- |
-| `python/billing_assistant.pyw` | Billing helper (Windows `.pyw`-friendly). Reads invoice details from a local Excel workbook; no secrets in-repo. |
-| `shell/upgrade_to_trixie.sh` | Debian 12 → 13. Default = preflight only; `--yes` required to upgrade (15s cold-feet pause; `--now` skips it). Ends with leftover report. Later: `--cleanup-only --yes`. |
+| [billing-assistant](billing-assistant/) | Windows billing helper (`.pyw`). |
+| [upgrade-to-trixie](upgrade-to-trixie/) | Debian 12 → 13 upgrade helper (bash). |
+| [openvpn-killswitch](openvpn-killswitch/) | Windows Firewall Arm/Disarm kill switch for OpenVPN GUI (PowerShell + WinForms). |
+
+**Repo rules for Windows tools:** no binaries, no build/compile steps. Scripts only.

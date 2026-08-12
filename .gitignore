@@ -22,3 +22,7 @@ Thumbs.db
 *.key
 *credentials*
 *api_keys*
+
+# Local Windows shortcuts (machine-specific paths)
+*.lnk
+
