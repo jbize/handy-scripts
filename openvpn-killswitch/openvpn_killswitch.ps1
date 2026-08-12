@@ -33,18 +33,36 @@
 .PARAMETER Connect
   After Arm, ask OpenVPN GUI to connect that profile.
 
+.PARAMETER RetryTunnels
+  While Armed, add missing firewall allows for OpenVPN tunnel adapters (same as Advanced -> Retry tunnel allows).
+
+.PARAMETER ExportFirewallSnapshot
+  While Disarmed (recommended): write firewall_restore.bak + dated snapshot under %LOCALAPPDATA%\HandyScripts.
+
+.PARAMETER RestoreFirewallBak
+  Disarm-like restore from firewall_restore.bak (re-enable snapshot Allows, restore defaults, remove KS rules).
+
 .EXAMPLE
   .\openvpn_killswitch.ps1 -Gui
 .EXAMPLE
   .\openvpn_killswitch.ps1 -Arm -Config home.ovpn -Connect
 .EXAMPLE
   .\openvpn_killswitch.ps1 -Disarm
+.EXAMPLE
+  .\openvpn_killswitch.ps1 -RetryTunnels
+.EXAMPLE
+  .\openvpn_killswitch.ps1 -ExportFirewallSnapshot
+.EXAMPLE
+  .\openvpn_killswitch.ps1 -RestoreFirewallBak
 #>
 [CmdletBinding(DefaultParameterSetName = 'Gui', SupportsShouldProcess = $true)]
 param(
     [Parameter(ParameterSetName = 'Gui')]
     [Parameter(ParameterSetName = 'Arm')]
     [Parameter(ParameterSetName = 'Disarm')]
+    [Parameter(ParameterSetName = 'RetryTunnels')]
+    [Parameter(ParameterSetName = 'ExportFirewall')]
+    [Parameter(ParameterSetName = 'RestoreFirewall')]
     [switch] $Gui,
 
     [Parameter(ParameterSetName = 'Arm', Mandatory = $true)]
@@ -58,6 +76,18 @@ param(
 
     [Parameter(ParameterSetName = 'ListConfigs')]
     [switch] $ListConfigs,
+
+    [Parameter(ParameterSetName = 'RetryTunnels', Mandatory = $true)]
+    [switch] $RetryTunnels,
+
+    [Parameter(ParameterSetName = 'ExportFirewall', Mandatory = $true)]
+    [switch] $ExportFirewallSnapshot,
+
+    [Parameter(ParameterSetName = 'RestoreFirewall', Mandatory = $true)]
+    [switch] $RestoreFirewallBak,
+
+    [Parameter(ParameterSetName = 'RestoreFirewall')]
+    [switch] $Force,
 
     [Parameter(ParameterSetName = 'Arm')]
     [string] $Config,
@@ -73,6 +103,7 @@ $script:RuleGroup = 'HandyScripts-OpenVPN-KillSwitch'
 $script:RulePrefix = 'HandyScripts-OpenVPN-KS'
 $script:StateDir = Join-Path $env:LOCALAPPDATA 'HandyScripts'
 $script:StatePath = Join-Path $script:StateDir 'openvpn_killswitch_state.json'
+$script:FirewallRestoreBakPath = Join-Path $script:StateDir 'firewall_restore.bak'
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -400,28 +431,24 @@ function Get-OpenVpnTunnelAdapters {
     @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { Test-IsTunnelAdapter $_ })
 }
 
-function Get-PrimaryLinkDnsServers {
-    $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
-        Sort-Object RouteMetric, InterfaceMetric |
-        Select-Object -First 1
-    if (-not $route) { return @() }
-    try {
-        $dns = Get-DnsClientServerAddress -InterfaceIndex $route.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
-        if ($dns -and $dns.ServerAddresses) {
-            return @($dns.ServerAddresses | Where-Object { $_ -and $_ -ne '0.0.0.0' })
-        }
-    }
-    catch { }
-    return @()
-}
-
 # -----------------------------------------------------------------------------
 # State / rules
 # -----------------------------------------------------------------------------
 
+function Get-ObjectPropertyValue {
+    param($Object, [string] $Name, $Default = $null)
+    if ($null -eq $Object) { return $Default }
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($null -eq $prop) { return $Default }
+    return $prop.Value
+}
+
 function Get-ExistingKillSwitchRules {
-    @(Get-NetFirewallRule -Group $script:RuleGroup -ErrorAction SilentlyContinue)
+    # Get-NetFirewallRule returns $null (not empty) when nothing matches.
+    # @( $null ) has Count=1 and StrictMode then dies on .Action / pipeline bind.
+    $rules = Get-NetFirewallRule -Group $script:RuleGroup -ErrorAction SilentlyContinue
+    if ($null -eq $rules) { return @() }
+    return @($rules | Where-Object { $_ })
 }
 
 function Test-IsKillSwitchArmed {
@@ -451,6 +478,330 @@ function Remove-KillSwitchStateFile {
     if (Test-Path -LiteralPath $script:StatePath) {
         Remove-Item -LiteralPath $script:StatePath -Force
     }
+}
+
+function Get-CurrentDefaultOutboundActions {
+    $saved = @{}
+    foreach ($p in @('Domain', 'Private', 'Public')) {
+        $fp = Get-NetFirewallProfile -Name $p
+        $saved[$p] = [string]$fp.DefaultOutboundAction
+    }
+    return $saved
+}
+
+function Get-EnabledOutboundAllowRuleNames {
+    # Names of outbound Allow rules currently Enabled (excluding this tool's group).
+    $otherAllows = @(Get-NetFirewallRule -Direction Outbound -Action Allow -Enabled True -ErrorAction SilentlyContinue |
+        Where-Object { $_.Group -ne $script:RuleGroup })
+    return @($otherAllows | ForEach-Object { $_.Name })
+}
+
+function New-FirewallRestoreSnapshot {
+    param(
+        [hashtable] $DefaultOutboundAction = $null,
+        [string[]] $EnabledOutboundAllowRules = $null
+    )
+    if ($null -eq $DefaultOutboundAction) {
+        $DefaultOutboundAction = Get-CurrentDefaultOutboundActions
+    }
+    if ($null -eq $EnabledOutboundAllowRules) {
+        $EnabledOutboundAllowRules = @(Get-EnabledOutboundAllowRuleNames)
+    }
+    return [pscustomobject]@{
+        Kind                       = 'HandyScripts-FirewallRestore'
+        Version                    = 1
+        SavedAt                    = (Get-Date).ToString('o')
+        DefaultOutboundAction      = $DefaultOutboundAction
+        EnabledOutboundAllowRules  = @($EnabledOutboundAllowRules)
+        RuleCount                  = @($EnabledOutboundAllowRules).Count
+    }
+}
+
+function Save-FirewallRestoreSnapshot {
+    <#
+      Writes firewall_restore.bak (quick Disarm-like restore) and a dated
+      firewall_snapshot_YYYYMMDD-HHMMSS.json copy under %LOCALAPPDATA%\HandyScripts.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        $Snapshot
+    )
+    if (-not (Test-Path -LiteralPath $script:StateDir)) {
+        New-Item -ItemType Directory -Path $script:StateDir -Force | Out-Null
+    }
+    $json = $Snapshot | ConvertTo-Json -Depth 8
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($script:FirewallRestoreBakPath, $json, $utf8NoBom)
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $dated = Join-Path $script:StateDir ("firewall_snapshot_{0}.json" -f $stamp)
+    [System.IO.File]::WriteAllText($dated, $json, $utf8NoBom)
+    return [pscustomobject]@{ BakPath = $script:FirewallRestoreBakPath; DatedPath = $dated }
+}
+
+function Read-FirewallRestoreBak {
+    param([string] $Path = $script:FirewallRestoreBakPath)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json)
+}
+
+function Get-FirewallBakAssessment {
+    <#
+      Decide Export/Restore enablement and warnings.
+      Serious: block. Mild: warn + confirm. Armed+intact state: extra confirm (prefer Disarm).
+    #>
+    param([string] $BakPath = $script:FirewallRestoreBakPath)
+
+    $armed = Test-IsKillSwitchArmed
+    $state = Read-KillSwitchState
+    $hasState = $null -ne $state
+    $bak = Read-FirewallRestoreBak -Path $BakPath
+    $hasBak = $null -ne $bak
+    $ruleCount = 0
+    $savedAt = $null
+    $ageDays = $null
+    if ($hasBak) {
+        $ruleCount = @($bak.EnabledOutboundAllowRules).Count
+        $savedAt = Get-ObjectPropertyValue -Object $bak -Name 'SavedAt' -Default $null
+        if ($savedAt) {
+            try {
+                $ageDays = [math]::Round(((Get-Date) - [datetime]$savedAt).TotalDays, 1)
+            }
+            catch { $ageDays = $null }
+        }
+    }
+
+    $exportBlocked = $null
+    if ($armed) {
+        $exportBlocked = 'Export only while DISARMED. Exporting while Armed can save a bad (already locked-down) restore list.'
+    }
+
+    $restoreBlocked = $null
+    if (-not $hasBak) {
+        $restoreBlocked = 'No firewall_restore.bak yet. Use Export firewall snapshot while DISARMED first.'
+    }
+
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $extraConfirm = $false
+
+    if ($hasBak -and $armed -and $hasState) {
+        [void]$warnings.Add('Kill switch is ARMED and state.json exists. Prefer DISARM. Use Restore from .bak only if Disarm failed or cannot run.')
+        $extraConfirm = $true
+    }
+    elseif ($hasBak -and $armed -and -not $hasState) {
+        [void]$warnings.Add('Armed but no state file - Restore from .bak is the intended break-glass path.')
+    }
+    elseif ($hasBak -and -not $armed) {
+        [void]$warnings.Add('Currently DISARMED. Restore will re-enable Allows from the bak and clear any leftover kill-switch rules.')
+    }
+
+    if ($null -ne $ageDays -and $ageDays -ge 7) {
+        [void]$warnings.Add(("Bak is {0} days old - may re-enable rules you later turned off on purpose." -f $ageDays))
+    }
+
+    if ($hasBak -and $ruleCount -gt 0 -and $ruleCount -lt 20) {
+        [void]$warnings.Add(("Bak lists only {0} enabled outbound Allows (unusually low). It may have been captured while already locked down." -f $ruleCount))
+        $extraConfirm = $true
+    }
+
+    if ($hasBak -and $ruleCount -eq 0) {
+        $restoreBlocked = 'Bak has zero EnabledOutboundAllowRules - refusing restore (would not bring Allows back). Export again while DISARMED.'
+    }
+
+    return [pscustomobject]@{
+        Armed                 = $armed
+        HasState              = $hasState
+        HasBak                = $hasBak
+        BakPath               = $BakPath
+        SavedAt               = $savedAt
+        AgeDays               = $ageDays
+        RuleCount             = $ruleCount
+        ExportBlockedReason   = $exportBlocked
+        RestoreBlockedReason  = $restoreBlocked
+        Warnings              = @($warnings)
+        NeedsExtraConfirm     = $extraConfirm
+        CanExport             = [string]::IsNullOrEmpty($exportBlocked)
+        CanRestore            = [string]::IsNullOrEmpty($restoreBlocked)
+    }
+}
+
+function Get-RestoreFirewallBakConfirmText {
+    param($Assessment)
+    $lines = New-Object System.Collections.Generic.List[string]
+    [void]$lines.Add('RESTORE FROM firewall_restore.bak')
+    [void]$lines.Add('')
+    [void]$lines.Add('This will:')
+    [void]$lines.Add('  1. Best-effort disconnect Armed VPN profile (if state knows it)')
+    [void]$lines.Add('  2. Undo hosts pins from Armed state (if any)')
+    [void]$lines.Add('  3. Remove HandyScripts kill-switch firewall rules')
+    [void]$lines.Add('  4. Restore DefaultOutboundAction from the bak')
+    [void]$lines.Add(('  5. Re-enable {0} outbound Allow rule name(s) from the bak' -f $Assessment.RuleCount))
+    [void]$lines.Add('  6. Delete openvpn_killswitch_state.json')
+    [void]$lines.Add('')
+    [void]$lines.Add(('Bak file: {0}' -f $Assessment.BakPath))
+    if ($Assessment.SavedAt) {
+        [void]$lines.Add(('Bak SavedAt: {0}' -f $Assessment.SavedAt))
+    }
+    if ($null -ne $Assessment.AgeDays) {
+        [void]$lines.Add(('Bak age: {0} days' -f $Assessment.AgeDays))
+    }
+    [void]$lines.Add(('Current: {0}' -f $(if ($Assessment.Armed) { 'ARMED' } else { 'DISARMED' })))
+    if ($Assessment.Warnings -and $Assessment.Warnings.Count -gt 0) {
+        [void]$lines.Add('')
+        [void]$lines.Add('WARNINGS:')
+        foreach ($w in $Assessment.Warnings) {
+            [void]$lines.Add(('  - {0}' -f $w))
+        }
+    }
+    [void]$lines.Add('')
+    [void]$lines.Add('Prefer normal DISARM when Armed with intact state.')
+    [void]$lines.Add('')
+    [void]$lines.Add('Yes = continue.  No = do nothing.')
+    return ($lines -join [Environment]::NewLine)
+}
+
+function Export-FirewallSnapshot {
+    <#
+      Capture current (pre-mutation) outbound defaults + enabled Allow rule names.
+      Primary: JSON bak + dated snapshot. Optional: netsh .wfw if elevation works.
+    #>
+    $assess = Get-FirewallBakAssessment
+    if (-not $assess.CanExport) {
+        throw $assess.ExportBlockedReason
+    }
+    Ensure-AdministratorForMutation
+    $snap = New-FirewallRestoreSnapshot
+    $paths = Save-FirewallRestoreSnapshot -Snapshot $snap
+    Write-Info ("Firewall restore snapshot: {0} enabled outbound Allow rule(s)" -f $snap.RuleCount)
+    Write-Info ("  Quick restore: {0}" -f $paths.BakPath)
+    Write-Info ("  Dated copy:    {0}" -f $paths.DatedPath)
+
+    $wfw = Join-Path $script:StateDir ('firewall_snapshot_{0}.wfw' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $wfwNote = $null
+    try {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $null = netsh advfirewall export $wfw 2>&1
+        $ErrorActionPreference = $prevEap
+        if ((Test-Path -LiteralPath $wfw) -and ((Get-Item -LiteralPath $wfw).Length -gt 0)) {
+            Write-Info ("  Full policy (.wfw): {0}" -f $wfw)
+            $wfwNote = $wfw
+        }
+        else {
+            $wfwNote = 'netsh .wfw export skipped/failed (NAPMONTR warning is often harmless; JSON bak is the quick-restore source of truth)'
+            Write-WarnMsg $wfwNote
+            if (Test-Path -LiteralPath $wfw) { Remove-Item -LiteralPath $wfw -Force -ErrorAction SilentlyContinue }
+        }
+    }
+    catch {
+        $wfwNote = ("netsh .wfw export failed: {0}" -f $_.Exception.Message)
+        Write-WarnMsg $wfwNote
+    }
+
+    return [pscustomobject]@{
+        BakPath    = $paths.BakPath
+        DatedPath  = $paths.DatedPath
+        WfwPath    = $wfwNote
+        RuleCount  = $snap.RuleCount
+    }
+}
+
+function Invoke-RestoreFirewallFromBak {
+    <#
+      Disarm-like recovery from firewall_restore.bak (or -Path).
+      Re-enables the outbound Allows that were Enabled when the snapshot was taken,
+      restores DefaultOutboundAction, removes kill-switch rules, clears Armed state.
+    #>
+    param(
+        [string] $Path = $script:FirewallRestoreBakPath,
+        [switch] $Force
+    )
+    if ($WhatIfPreference) {
+        Write-Info ("WhatIf: would restore firewall from {0}" -f $Path)
+        return
+    }
+
+    $assess = Get-FirewallBakAssessment -BakPath $Path
+    if (-not $assess.CanRestore) {
+        throw $assess.RestoreBlockedReason
+    }
+
+    if (-not $Force) {
+        Write-Host (Get-RestoreFirewallBakConfirmText -Assessment $assess)
+        if ($assess.NeedsExtraConfirm) {
+            Write-Host ''
+            Write-Host 'EXTRA CONFIRMATION REQUIRED (risky situation).'
+            $ans = Read-Host 'Type RESTORE (all caps) to continue, or press Enter to cancel'
+            if ($ans -ne 'RESTORE') {
+                throw 'Restore cancelled.'
+            }
+        }
+        else {
+            $ans = Read-Host 'Type YES to continue, or press Enter to cancel'
+            if ($ans -ne 'YES') {
+                throw 'Restore cancelled.'
+            }
+        }
+    }
+
+    Ensure-AdministratorForMutation
+    $bak = Read-FirewallRestoreBak -Path $Path
+    if (-not $bak) {
+        throw ("No firewall restore bak at '{0}'. Use Testing -> Export firewall snapshot first (while Disarmed)." -f $Path)
+    }
+    $kind = [string](Get-ObjectPropertyValue -Object $bak -Name 'Kind' -Default '')
+    if ($kind -and $kind -ne 'HandyScripts-FirewallRestore') {
+        Write-WarnMsg ("Unexpected bak Kind='{0}' - continuing anyway." -f $kind)
+    }
+
+    # Best-effort: if Armed state exists, disconnect + undo hosts from that session.
+    $state = Read-KillSwitchState
+    if ($state) {
+        try {
+            $install = Get-OpenVpnInstallInfo
+            $cfg = [string](Get-ObjectPropertyValue -Object $state -Name 'ConfigPath' -Default '')
+            if ($cfg) {
+                Write-Info ("Best-effort disconnect of Armed profile: {0}" -f $cfg)
+                Disconnect-OpenVpnGuiProfile -GuiExe $install.GuiExe -ConfigPath $cfg
+            }
+        }
+        catch {
+            Write-Info ("Disconnect skipped: {0}" -f $_.Exception.Message)
+        }
+        try {
+            Undo-KillSwitchHostsFromState -State $state
+        }
+        catch {
+            Write-WarnMsg ("Hosts undo from Armed state failed: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    $existing = @(Get-ExistingKillSwitchRules)
+    if ($existing.Count -gt 0) {
+        Write-Info ("Removing {0} kill-switch rule(s)..." -f $existing.Count)
+        $existing | Remove-NetFirewallRule -ErrorAction Stop
+    }
+
+    if ($bak.DefaultOutboundAction) {
+        foreach ($p in @('Domain', 'Private', 'Public')) {
+            $val = $bak.DefaultOutboundAction.$p
+            if ($val) {
+                Write-Info ("Restoring {0} DefaultOutboundAction={1}" -f $p, $val)
+                Set-NetFirewallProfile -Profile $p -DefaultOutboundAction $val
+            }
+        }
+    }
+
+    $names = @($bak.EnabledOutboundAllowRules)
+    if ($names.Count -gt 0) {
+        Write-Info ("Re-enabling {0} outbound Allow rule(s) from bak..." -f $names.Count)
+        [void](Set-OutboundAllowRulesEnabled -Names $names -Enabled $true)
+    }
+    else {
+        Write-WarnMsg 'Bak has no EnabledOutboundAllowRules list.'
+    }
+
+    Remove-KillSwitchStateFile
+    Write-Info ("Restored from bak: {0}" -f $Path)
 }
 
 function New-KillSwitchRuleName([string] $Suffix) {
@@ -738,8 +1089,14 @@ function Sync-KillSwitchHostsEntry {
         }
     }
 
+    $previousLine = [string]$lines[$primaryIdx]
     if (-not $WhatIfPreference) {
-        $lines[$primaryIdx] = "$Ip`t$Hostname"
+        # Preserve any other hostnames on the same line (do not wipe aliases).
+        $otherNames = @($primaryParts[1..($primaryParts.Count - 1)] | Where-Object {
+                $_.ToLowerInvariant() -ne $hostLower
+            })
+        $nameList = @($Hostname) + @($otherNames)
+        $lines[$primaryIdx] = "$Ip`t$($nameList -join "`t")"
         # Drop duplicate hostname lines (keep first updated)
         for ($j = $matchIndexes.Count - 1; $j -ge 1; $j--) {
             [void]$lines.RemoveAt($matchIndexes[$j])
@@ -748,11 +1105,12 @@ function Sync-KillSwitchHostsEntry {
     }
     Write-Info ("Hosts: updated {0} {1} -> {2}" -f $Hostname, $currentIp, $Ip)
     return [pscustomobject]@{
-        Hostname   = $Hostname
-        Ip         = $Ip
-        Action     = 'updated'
-        Owned      = $true
-        PreviousIp = $currentIp
+        Hostname     = $Hostname
+        Ip           = $Ip
+        Action       = 'updated'
+        Owned        = $true
+        PreviousIp   = $currentIp
+        PreviousLine = $previousLine
     }
 }
 
@@ -778,10 +1136,12 @@ function Undo-KillSwitchHostsFromState {
 
     foreach ($entry in $managed) {
         if (-not $entry) { continue }
-        $action = [string]$entry.Action
-        $hostname = [string]$entry.Hostname
+        $action = [string](Get-ObjectPropertyValue -Object $entry -Name 'Action' -Default '')
+        $hostname = [string](Get-ObjectPropertyValue -Object $entry -Name 'Hostname' -Default '')
         $owned = $false
-        if (($entry.PSObject.Properties.Name -contains 'Owned') -and $entry.Owned) { $owned = [bool]$entry.Owned }
+        if ($null -ne (Get-ObjectPropertyValue -Object $entry -Name 'Owned')) {
+            $owned = [bool](Get-ObjectPropertyValue -Object $entry -Name 'Owned')
+        }
         if (-not $owned) { continue }
 
         $hostLower = $hostname.ToLowerInvariant()
@@ -808,6 +1168,7 @@ function Undo-KillSwitchHostsFromState {
             Write-Info ("Hosts: removed managed entry for {0}" -f $hostname)
         }
         elseif ($action -eq 'updated' -and ($entry.PSObject.Properties.Name -contains 'PreviousIp') -and $entry.PreviousIp) {
+            $previousLine = [string](Get-ObjectPropertyValue -Object $entry -Name 'PreviousLine' -Default '')
             for ($i = 0; $i -lt $lines.Count; $i++) {
                 $trim = $lines[$i].Trim()
                 if ($trim.StartsWith('#')) { continue }
@@ -815,7 +1176,12 @@ function Undo-KillSwitchHostsFromState {
                 if ($parts.Count -ge 2) {
                     $names = @($parts[1..($parts.Count - 1)] | ForEach-Object { $_.ToLowerInvariant() })
                     if ($names -contains $hostLower) {
-                        $lines[$i] = ("{0}`t{1}" -f [string]$entry.PreviousIp, $hostname)
+                        if (-not [string]::IsNullOrWhiteSpace($previousLine)) {
+                            $lines[$i] = $previousLine
+                        }
+                        else {
+                            $lines[$i] = ("{0}`t{1}" -f [string]$entry.PreviousIp, $hostname)
+                        }
                         $changed = $true
                         Write-Info ("Hosts: restored {0} -> {1}" -f $hostname, $entry.PreviousIp)
                         break
@@ -838,12 +1204,16 @@ function Get-ArmPlanSummary {
         [string[]] $ConfigWarnings
     )
     $lines = New-Object System.Collections.Generic.List[string]
-    [void]$lines.Add('Set DefaultOutboundAction=Block on Domain/Private/Public')
-    [void]$lines.Add('Disable other outbound Allow rules (saved for Disarm)')
-    [void]$lines.Add('Allow DHCP UDP 68->67 (any interface)')
+    [void]$lines.Add('Create DHCP + VPN endpoint (+ tunnel) allow rules first')
+    [void]$lines.Add('Then disable other outbound Allow rules (saved for Disarm)')
+    [void]$lines.Add('Then set DefaultOutboundAction=Block on Domain/Private/Public')
     [void]$lines.Add('No uplink DNS allows - DNS only via OpenVPN tunnel adapters when present')
     foreach ($h in $HostsActions) {
-        [void]$lines.Add(('Hosts {0}: {1} -> {2}' -f $h.Action, $h.Hostname, $h.Ip))
+        if (-not $h) { continue }
+        [void]$lines.Add(('Hosts {0}: {1} -> {2}' -f
+                (Get-ObjectPropertyValue -Object $h -Name 'Action' -Default '?'),
+                (Get-ObjectPropertyValue -Object $h -Name 'Hostname' -Default '?'),
+                (Get-ObjectPropertyValue -Object $h -Name 'Ip' -Default '?')))
     }
     foreach ($ep in $Endpoints) {
         [void]$lines.Add(('Allow VPN {0}:{1}/{2} (any interface)' -f $ep.IP, $ep.Port, $ep.Proto))
@@ -861,6 +1231,43 @@ function Get-ArmPlanSummary {
     }
     if ($lines.Count -eq 0) { return @() }
     return [string[]]$lines.ToArray()
+}
+
+function New-KillSwitchAllowRules {
+    param(
+        [object[]] $Endpoints,
+        [object[]] $TunnelAdapters
+    )
+    Write-Info ("Creating allow rules in group '{0}' (no uplink DNS)..." -f $script:RuleGroup)
+
+    New-FwAllowRule -Properties @{
+        DisplayName = "$script:RulePrefix Allow DHCP"
+        Name        = (New-KillSwitchRuleName 'allow-dhcp')
+        Protocol    = 'UDP'
+        LocalPort   = 68
+        RemotePort  = 67
+    }
+
+    $i = 0
+    foreach ($ep in $Endpoints) {
+        $i++
+        New-FwAllowRule -Properties @{
+            DisplayName   = ("$script:RulePrefix Allow VPN {0}:{1}/{2}" -f $ep.IP, $ep.Port, $ep.Proto.ToUpperInvariant())
+            Name          = (New-KillSwitchRuleName "allow-vpn-$i")
+            Protocol      = $ep.Proto.ToUpperInvariant()
+            RemoteAddress = $ep.IP
+            RemotePort    = $ep.Port
+        }
+    }
+
+    foreach ($tun in $TunnelAdapters) {
+        $tunSuffix = 'allow-tun-' + (($tun.Name -replace '[^\w\-]', '_'))
+        New-FwAllowRule -Properties @{
+            DisplayName    = ("$script:RulePrefix Allow tunnel ({0})" -f $tun.Name)
+            Name           = (New-KillSwitchRuleName $tunSuffix)
+            InterfaceAlias = $tun.Name
+        }
+    }
 }
 
 function Invoke-ArmKillSwitch {
@@ -908,93 +1315,101 @@ function Invoke-ArmKillSwitch {
 
     Ensure-AdministratorForMutation
 
-    # If re-Arming, undo hosts pins from the previous session first.
-    $previousState = Read-KillSwitchState
-    if ($previousState) {
-        Undo-KillSwitchHostsFromState -State $previousState
+    # Re-Arm while Armed would re-snapshot Block/disabled allows and break Disarm restore.
+    if (Test-IsKillSwitchArmed) {
+        throw 'Kill switch is already Armed. Disarm first, then Arm again (re-Arm would overwrite restore data and risk a stuck Block policy).'
     }
 
-    # Pin hostname remotes in hosts ONCE so reconnect needs no uplink DNS.
+    # Capture restore snapshot BEFORE hosts / firewall mutation (while still open).
+    $savedOutbound = Get-CurrentDefaultOutboundActions
+    $disabledNames = @(Get-EnabledOutboundAllowRuleNames)
+
     $hostsManaged = New-Object System.Collections.Generic.List[object]
-    foreach ($h in $plannedHosts) {
-        [void]$hostsManaged.Add((Sync-KillSwitchHostsEntry -Hostname $h.Hostname -Ip $h.Ip))
-    }
-    $endpoints = @(Resolve-RemoteEndpoints -Remotes $remotes)
+    $stateWritten = $false
+    $armedOk = $false
+    try {
+        # Pin hostname remotes in hosts ONCE so reconnect needs no uplink DNS.
+        foreach ($h in $plannedHosts) {
+            [void]$hostsManaged.Add((Sync-KillSwitchHostsEntry -Hostname $h.Hostname -Ip $h.Ip))
+        }
+        $endpoints = @(Resolve-RemoteEndpoints -Remotes $remotes)
 
-    # Capture restore state before mutation
-    $profiles = @('Domain', 'Private', 'Public')
-    $savedOutbound = @{}
-    foreach ($p in $profiles) {
-        $fp = Get-NetFirewallProfile -Name $p
-        $savedOutbound[$p] = [string]$fp.DefaultOutboundAction
-    }
-    $otherAllows = @(Get-NetFirewallRule -Direction Outbound -Action Allow -Enabled True -ErrorAction SilentlyContinue |
-        Where-Object { $_.Group -ne $script:RuleGroup })
-    $disabledNames = @($otherAllows | ForEach-Object { $_.Name })
+        $state = [pscustomobject]@{
+            SavedAt                    = (Get-Date).ToString('o')
+            ConfigPath                 = $configPath
+            DefaultOutboundAction      = $savedOutbound
+            DisabledOutboundAllowRules = $disabledNames
+            Endpoints                  = @($endpoints | ForEach-Object {
+                    [pscustomobject]@{ Host = $_.Host; IP = $_.IP; Port = $_.Port; Proto = $_.Proto }
+                })
+            HostsManaged               = $(if ($hostsManaged.Count -eq 0) { @() } else { [object[]]$hostsManaged.ToArray() })
+            ConfigWarnings             = @($configWarnings)
+            ConnectRequested           = [bool]$ConnectAfter
+        }
+        # Persist HostsManaged + restore data before firewall mutation so Disarm can recover.
+        Write-KillSwitchState -State $state
+        $stateWritten = $true
 
-    $state = [pscustomobject]@{
-        SavedAt                    = (Get-Date).ToString('o')
-        ConfigPath                 = $configPath
-        DefaultOutboundAction      = $savedOutbound
-        DisabledOutboundAllowRules = $disabledNames
-        Endpoints                  = @($endpoints | ForEach-Object {
-                [pscustomobject]@{ Host = $_.Host; IP = $_.IP; Port = $_.Port; Proto = $_.Proto }
-            })
-        HostsManaged               = $(if ($hostsManaged.Count -eq 0) { @() } else { [object[]]$hostsManaged.ToArray() })
-        ConfigWarnings             = @($configWarnings)
-        ConnectRequested           = [bool]$ConnectAfter
-    }
-    Write-KillSwitchState -State $state
+        # Durable Disarm-like bak (survives if state.json is lost) + dated snapshot.
+        $bakSnap = New-FirewallRestoreSnapshot -DefaultOutboundAction $savedOutbound -EnabledOutboundAllowRules $disabledNames
+        $bakPaths = Save-FirewallRestoreSnapshot -Snapshot $bakSnap
+        Write-Info ("Firewall restore bak updated: {0}" -f $bakPaths.BakPath)
 
-    $existing = @(Get-ExistingKillSwitchRules)
-    if ($existing.Count -gt 0) {
-        Write-Info ("Removing {0} previous kill-switch rule(s)..." -f $existing.Count)
-        $existing | Remove-NetFirewallRule -ErrorAction Stop
-    }
+        $existing = @(Get-ExistingKillSwitchRules)
+        if ($existing.Count -gt 0) {
+            Write-Info ("Removing {0} previous kill-switch rule(s)..." -f $existing.Count)
+            $existing | Remove-NetFirewallRule -ErrorAction Stop
+        }
 
-    Write-Info ("Disabling {0} other outbound Allow rule(s)..." -f $disabledNames.Count)
-    [void](Set-OutboundAllowRulesEnabled -Names $disabledNames -Enabled $false)
+        # Create escape hatches FIRST, then lock the door (avoids a Block-with-no-allows window).
+        New-KillSwitchAllowRules -Endpoints $endpoints -TunnelAdapters $tunnels
 
-    Write-Info 'Setting DefaultOutboundAction=Block...'
-    Set-NetFirewallProfile -Profile Domain, Private, Public -DefaultOutboundAction Block
+        Write-Info ("Disabling {0} other outbound Allow rule(s)..." -f $disabledNames.Count)
+        [void](Set-OutboundAllowRulesEnabled -Names $disabledNames -Enabled $false)
 
-    Write-Info ("Creating allow rules in group '{0}' (no uplink DNS)..." -f $script:RuleGroup)
+        Write-Info 'Setting DefaultOutboundAction=Block...'
+        Set-NetFirewallProfile -Profile Domain, Private, Public -DefaultOutboundAction Block
 
-    New-FwAllowRule -Properties @{
-        DisplayName = "$script:RulePrefix Allow DHCP"
-        Name        = (New-KillSwitchRuleName 'allow-dhcp')
-        Protocol    = 'UDP'
-        LocalPort   = 68
-        RemotePort  = 67
-    }
+        $armedOk = $true
+        Write-Info ("Armed. State: {0}" -f $script:StatePath)
 
-    $i = 0
-    foreach ($ep in $endpoints) {
-        $i++
-        New-FwAllowRule -Properties @{
-            DisplayName   = ("$script:RulePrefix Allow VPN {0}:{1}/{2}" -f $ep.IP, $ep.Port, $ep.Proto.ToUpperInvariant())
-            Name          = (New-KillSwitchRuleName "allow-vpn-$i")
-            Protocol      = $ep.Proto.ToUpperInvariant()
-            RemoteAddress = $ep.IP
-            RemotePort    = $ep.Port
+        if ($ConnectAfter) {
+            try {
+                Connect-OpenVpnGuiProfile -GuiExe $install.GuiExe -ConfigPath $configPath
+                Wait-OpenVpnTunnelAllowRules -TimeoutSeconds 30 -PollSeconds 2
+            }
+            catch {
+                # Firewall Arm already succeeded — do not roll back for a connect/poll problem.
+                Write-WarnMsg ("Armed, but connect/tunnel-allow step failed: {0}" -f $_.Exception.Message)
+            }
         }
     }
-
-    $ti = 0
-    foreach ($tun in $tunnels) {
-        $ti++
-        New-FwAllowRule -Properties @{
-            DisplayName    = ("$script:RulePrefix Allow tunnel ({0})" -f $tun.Name)
-            Name           = (New-KillSwitchRuleName "allow-tun-$ti")
-            InterfaceAlias = $tun.Name
+    catch {
+        if ($armedOk) {
+            throw
         }
-    }
-
-    Write-Info ("Armed. State: {0}" -f $script:StatePath)
-
-    if ($ConnectAfter) {
-        Connect-OpenVpnGuiProfile -GuiExe $install.GuiExe -ConfigPath $configPath
-        Wait-OpenVpnTunnelAllowRules -TimeoutSeconds 30 -PollSeconds 2
+        if (-not $stateWritten -and $hostsManaged.Count -gt 0) {
+            Write-WarnMsg 'Arm failed before state was saved — undoing hosts pins from this attempt.'
+            try {
+                Undo-KillSwitchHostsFromState -State ([pscustomobject]@{
+                        HostsManaged = [object[]]$hostsManaged.ToArray()
+                    })
+            }
+            catch {
+                Write-WarnMsg ("Hosts undo after failed Arm also failed: {0}" -f $_.Exception.Message)
+            }
+        }
+        elseif ($stateWritten) {
+            Write-WarnMsg 'Arm failed after state was saved — auto-Disarm to restore firewall and hosts.'
+            try {
+                Invoke-DisarmKillSwitch
+                Write-WarnMsg 'Auto-Disarm finished. You are back to Disarmed; fix the error and Arm again.'
+            }
+            catch {
+                Write-WarnMsg ("Auto-Disarm failed: {0}. Manually run Disarm (as Administrator) to restore networking." -f $_.Exception.Message)
+            }
+        }
+        throw
     }
 }
 
@@ -1006,23 +1421,22 @@ function Update-TunnelAllowRules {
     if ($existing.Count -eq 0) { return 0 }
     $tunnels = @(Get-OpenVpnTunnelAdapters)
     $added = 0
-    $ti = 0
     foreach ($tun in $tunnels) {
-        $ti++
-        $name = New-KillSwitchRuleName "allow-tun-$ti"
+        $display = ("$script:RulePrefix Allow tunnel ({0})" -f $tun.Name)
+        $tunSuffix = 'allow-tun-' + (($tun.Name -replace '[^\w\-]', '_'))
+        $name = New-KillSwitchRuleName $tunSuffix
         $already = @($existing | Where-Object {
-                $_.Name -eq $name -or $_.DisplayName -eq ("$script:RulePrefix Allow tunnel ({0})" -f $tun.Name)
+                $_.Name -eq $name -or $_.DisplayName -eq $display
             })
         if ($already.Count -gt 0) { continue }
         if (-not (Test-IsAdministrator)) { continue }
         New-FwAllowRule -Properties @{
-            DisplayName    = ("$script:RulePrefix Allow tunnel ({0})" -f $tun.Name)
+            DisplayName    = $display
             Name           = $name
             InterfaceAlias = $tun.Name
         }
         Write-Info ("Added tunnel allow for '{0}'." -f $tun.Name)
         $added++
-        # Keep $existing in sync for subsequent iterations in this call
         $existing = @(Get-ExistingKillSwitchRules)
     }
     return $added
@@ -1150,7 +1564,10 @@ function Get-StatusText {
     $rules = @(Get-ExistingKillSwitchRules)
     [void]$sb.AppendLine(('  Rules in group: {0}' -f $rules.Count))
     foreach ($rule in ($rules | Sort-Object DisplayName)) {
-        [void]$sb.AppendLine(('    [{0}] {1}' -f $rule.Action, $rule.DisplayName))
+        if (-not $rule) { continue }
+        $action = Get-ObjectPropertyValue -Object $rule -Name 'Action' -Default '?'
+        $disp = Get-ObjectPropertyValue -Object $rule -Name 'DisplayName' -Default '(unnamed)'
+        [void]$sb.AppendLine(('    [{0}] {1}' -f $action, $disp))
     }
     return $sb.ToString()
 }
@@ -1224,6 +1641,35 @@ function Hide-ConsoleWindow {
     }
 }
 
+function Get-RoadWarriorVerifierLaunch {
+    <#
+      Returns @{ Exe; ArgumentList; ScriptPath } if verify_roadwarrior.pyw and a Python
+      launcher exist next to this script; otherwise $null.
+    #>
+    $scriptPath = Join-Path $PSScriptRoot 'verify_roadwarrior.pyw'
+    if (-not (Test-Path -LiteralPath $scriptPath)) { return $null }
+
+    foreach ($name in @('pythonw', 'python', 'py')) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if (-not $cmd) { continue }
+        $exe = [string]$cmd.Source
+        if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { continue }
+        if ($name -eq 'py') {
+            return [pscustomobject]@{
+                Exe          = $exe
+                ArgumentList = @('-3', $scriptPath)
+                ScriptPath   = $scriptPath
+            }
+        }
+        return [pscustomobject]@{
+            Exe          = $exe
+            ArgumentList = @($scriptPath)
+            ScriptPath   = $scriptPath
+        }
+    }
+    return $null
+}
+
 function Show-KillSwitchGui {
     Hide-ConsoleWindow
     Add-Type -AssemblyName System.Windows.Forms
@@ -1239,9 +1685,9 @@ function Show-KillSwitchGui {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'OpenVPN Kill Switch'
-    $form.Size = New-Object System.Drawing.Size(520, 640)
+    $form.Size = New-Object System.Drawing.Size(520, 740)
     $form.StartPosition = 'CenterScreen'
-    $form.MinimumSize = New-Object System.Drawing.Size(480, 580)
+    $form.MinimumSize = New-Object System.Drawing.Size(480, 620)
 
     $toolTip = New-Object System.Windows.Forms.ToolTip
     $toolTip.AutoPopDelay = 12000
@@ -1366,7 +1812,7 @@ function Show-KillSwitchGui {
     $grpTest = New-Object System.Windows.Forms.GroupBox
     $grpTest.Text = 'Testing'
     $grpTest.Location = New-Object System.Drawing.Point(12, 428)
-    $grpTest.Size = New-Object System.Drawing.Size(480, 72)
+    $grpTest.Size = New-Object System.Drawing.Size(480, 150)
     $grpTest.Anchor = 'Bottom,Left,Right'
     $form.Controls.Add($grpTest)
 
@@ -1389,7 +1835,7 @@ function Show-KillSwitchGui {
     $btnStateFolder.Location = New-Object System.Drawing.Point(238, 28)
     $btnStateFolder.Size = New-Object System.Drawing.Size(118, 28)
     $grpTest.Controls.Add($btnStateFolder)
-    $toolTip.SetToolTip($btnStateFolder, 'Open %LOCALAPPDATA%\HandyScripts\ (state JSON used for Disarm restore).')
+    $toolTip.SetToolTip($btnStateFolder, 'Open %LOCALAPPDATA%\HandyScripts\ (state JSON, firewall_restore.bak, dated snapshots).')
 
     $btnCopy = New-Object System.Windows.Forms.Button
     $btnCopy.Text = 'Copy status'
@@ -1398,14 +1844,65 @@ function Show-KillSwitchGui {
     $grpTest.Controls.Add($btnCopy)
     $toolTip.SetToolTip($btnCopy, 'Copy the status log text to the clipboard.')
 
+    $verifierLaunch = Get-RoadWarriorVerifierLaunch
+    $btnVerifier = New-Object System.Windows.Forms.Button
+    $btnVerifier.Text = 'Open verifier'
+    $btnVerifier.Location = New-Object System.Drawing.Point(12, 64)
+    $btnVerifier.Size = New-Object System.Drawing.Size(140, 28)
+    $grpTest.Controls.Add($btnVerifier)
+    if ($verifierLaunch) {
+        $btnVerifier.Enabled = $true
+        $toolTip.SetToolTip($btnVerifier, ('Launch road-warrior verifier ({0}). Run Baseline while Disarmed on this network before Arm + Connect.' -f $verifierLaunch.ScriptPath))
+    }
+    else {
+        $btnVerifier.Enabled = $false
+        $toolTip.SetToolTip($btnVerifier, 'Verifier unavailable: need verify_roadwarrior.pyw next to this script and python/pythonw/py on PATH.')
+    }
+
+    $btnExportFw = New-Object System.Windows.Forms.Button
+    $btnExportFw.Text = 'Export firewall snapshot'
+    $btnExportFw.Location = New-Object System.Drawing.Point(160, 64)
+    $btnExportFw.Size = New-Object System.Drawing.Size(160, 28)
+    $grpTest.Controls.Add($btnExportFw)
+    $toolTip.SetToolTip($btnExportFw, 'While Disarmed: save firewall_restore.bak + dated snapshot under %LOCALAPPDATA%\HandyScripts\ (Disarm-like quick restore). Do this before risky tests.')
+
+    $btnRestoreBak = New-Object System.Windows.Forms.Button
+    $btnRestoreBak.Text = 'Restore from .bak'
+    $btnRestoreBak.Location = New-Object System.Drawing.Point(328, 64)
+    $btnRestoreBak.Size = New-Object System.Drawing.Size(140, 28)
+    $grpTest.Controls.Add($btnRestoreBak)
+    $toolTip.SetToolTip($btnRestoreBak, 'Disarm-like recovery from firewall_restore.bak: re-enable snapshot Allows, restore defaults, remove kill-switch rules. Prefer Disarm when Armed with intact state.')
+
     $btnExit = New-Object System.Windows.Forms.Button
     $btnExit.Text = 'Exit'
-    $btnExit.Location = New-Object System.Drawing.Point(382, 512)
+    $btnExit.Location = New-Object System.Drawing.Point(382, 600)
     $btnExit.Size = New-Object System.Drawing.Size(110, 28)
     $btnExit.Anchor = 'Bottom,Right'
     $form.Controls.Add($btnExit)
     $form.CancelButton = $btnExit
     $toolTip.SetToolTip($btnExit, 'Close this window. Does not Disarm -- the kill switch stays Armed until you Disarm.')
+
+    function Update-GuiFirewallBakButtons {
+        $a = Get-FirewallBakAssessment
+        $btnExportFw.Enabled = [bool]$a.CanExport
+        $btnRestoreBak.Enabled = [bool]$a.CanRestore
+        if ($a.CanExport) {
+            $toolTip.SetToolTip($btnExportFw, 'While Disarmed: save firewall_restore.bak + dated snapshot. Do this before risky tests.')
+        }
+        else {
+            $toolTip.SetToolTip($btnExportFw, [string]$a.ExportBlockedReason)
+        }
+        if ($a.CanRestore) {
+            $tip = 'Opens an Are you sure? dialog first. Disarm-like recovery from firewall_restore.bak.'
+            if ($a.NeedsExtraConfirm) {
+                $tip = 'RISKY: will ask for an extra confirmation. Prefer Disarm when Armed with intact state. ' + $tip
+            }
+            $toolTip.SetToolTip($btnRestoreBak, $tip)
+        }
+        else {
+            $toolTip.SetToolTip($btnRestoreBak, [string]$a.RestoreBlockedReason)
+        }
+    }
 
     function Set-GuiBusy([bool] $Busy, [string] $BusyText = '') {
         $form.UseWaitCursor = $Busy
@@ -1419,6 +1916,16 @@ function Show-KillSwitchGui {
         $btnEndpoints.Enabled = -not $Busy
         $btnStateFolder.Enabled = -not $Busy
         $btnCopy.Enabled = -not $Busy
+        # Export/Restore enablement depends on Armed + bak presence (refreshed in Set-GuiStatus).
+        if (-not $Busy) {
+            Update-GuiFirewallBakButtons
+        }
+        else {
+            $btnExportFw.Enabled = $false
+            $btnRestoreBak.Enabled = $false
+        }
+        # Verifier stays disabled if Python/script missing; otherwise follow busy state.
+        $btnVerifier.Enabled = (-not $Busy) -and ($null -ne $verifierLaunch)
         # Keep Exit available so the window is never trapped if something goes wrong
         if ($Busy -and $BusyText) {
             $lblStatus.Text = $BusyText
@@ -1446,7 +1953,7 @@ function Show-KillSwitchGui {
         }
         catch {
             [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Kill Switch') | Out-Null
-            Set-GuiStatus
+            try { Set-GuiStatus } catch { }
         }
         finally {
             $script:GuiBusy = $false
@@ -1465,6 +1972,9 @@ function Show-KillSwitchGui {
             $lblStatus.ForeColor = [System.Drawing.Color]::DarkRed
         }
         $txtLog.Text = Get-StatusText
+        if (-not $script:GuiBusy) {
+            Update-GuiFirewallBakButtons
+        }
     }
 
     function Get-SelectedConfigPath {
@@ -1495,6 +2005,22 @@ function Show-KillSwitchGui {
     $btnCopy.Add_Click({
             [System.Windows.Forms.Clipboard]::SetText($txtLog.Text)
             [System.Windows.Forms.MessageBox]::Show('Status copied to clipboard.', 'Kill Switch') | Out-Null
+        })
+    $btnVerifier.Add_Click({
+            if ($script:GuiBusy) { return }
+            $launch = Get-RoadWarriorVerifierLaunch
+            if (-not $launch) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    'Verifier unavailable. Need verify_roadwarrior.pyw beside this script and python, pythonw, or py on PATH.',
+                    'Open verifier') | Out-Null
+                return
+            }
+            try {
+                Start-Process -FilePath $launch.Exe -ArgumentList $launch.ArgumentList -ErrorAction Stop | Out-Null
+            }
+            catch {
+                [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Open verifier failed') | Out-Null
+            }
         })
     $btnStateFolder.Add_Click({
             if (-not (Test-Path $script:StateDir)) {
@@ -1542,7 +2068,7 @@ function Show-KillSwitchGui {
     $btnRetryTunnels.Add_Click({
             try {
                 if (-not (Test-IsAdministrator)) {
-                    Request-AdministratorElevation -ExtraArgs @('-Gui')
+                    Request-AdministratorElevation -ExtraArgs @('-RetryTunnels', '-Gui')
                     return
                 }
                 Invoke-GuiFirewallAction -BusyText 'Retrying tunnel allows...' -Action {
@@ -1612,6 +2138,77 @@ function Show-KillSwitchGui {
             }
         })
 
+    $btnExportFw.Add_Click({
+            try {
+                $a = Get-FirewallBakAssessment
+                if (-not $a.CanExport) {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        [string]$a.ExportBlockedReason,
+                        'Export firewall snapshot',
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+                    return
+                }
+                if (-not (Test-IsAdministrator)) {
+                    Request-AdministratorElevation -ExtraArgs @('-ExportFirewallSnapshot', '-Gui')
+                    return
+                }
+                Invoke-GuiFirewallAction -BusyText 'Exporting firewall snapshot...' -Action {
+                    $r = Export-FirewallSnapshot
+                    Write-Info ("Exported {0} enabled outbound Allow rule name(s)." -f $r.RuleCount)
+                } -SuccessMessage ("Saved firewall_restore.bak + dated snapshot under:`n{0}`n`nUse Restore from .bak for Disarm-like recovery if state is lost." -f $script:StateDir)
+            }
+            catch {
+                [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Export failed') | Out-Null
+                Set-GuiStatus
+            }
+        })
+
+    $btnRestoreBak.Add_Click({
+            if ($script:GuiBusy) { return }
+            $a = Get-FirewallBakAssessment
+            if (-not $a.CanRestore) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    [string]$a.RestoreBlockedReason,
+                    'Restore from .bak',
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+                return
+            }
+
+            $body = Get-RestoreFirewallBakConfirmText -Assessment $a
+            $confirm = [System.Windows.Forms.MessageBox]::Show(
+                $body,
+                'Are you sure? Restore from .bak',
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning)
+            if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+            if ($a.NeedsExtraConfirm) {
+                $extra = [System.Windows.Forms.MessageBox]::Show(
+                    "EXTRA CONFIRMATION`n`nThis situation is risky (Armed with state, or bak looks unusually small).`n`nPrefer DISARM if the kill switch is Armed and Disarm still works.`n`nYes = I understand, restore anyway.`nNo = do nothing.",
+                    'Extra confirmation required',
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Error)
+                if ($extra -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+            }
+
+            try {
+                if (-not (Test-IsAdministrator)) {
+                    # -Force: user already confirmed in this GUI; elevated child must not hang on Read-Host.
+                    Request-AdministratorElevation -ExtraArgs @('-RestoreFirewallBak', '-Force', '-Gui')
+                    return
+                }
+                Invoke-GuiFirewallAction -BusyText 'Restoring from firewall_restore.bak...' -Action {
+                    Invoke-RestoreFirewallFromBak -Force
+                } -SuccessMessage 'Restored from firewall_restore.bak.'
+            }
+            catch {
+                [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Restore failed') | Out-Null
+                Set-GuiStatus
+            }
+        })
+
     # Closing the form does NOT Disarm.
     $form.Add_Shown({ Set-GuiStatus })
     [void]$form.ShowDialog()
@@ -1622,7 +2219,7 @@ function Show-KillSwitchGui {
 # -----------------------------------------------------------------------------
 
 # Default to GUI when no action switches were bound (DefaultParameterSetName = Gui)
-if (-not $Arm -and -not $Disarm -and -not $Status -and -not $ListConfigs -and -not $Gui) {
+if (-not $Arm -and -not $Disarm -and -not $Status -and -not $ListConfigs -and -not $RetryTunnels -and -not $ExportFirewallSnapshot -and -not $RestoreFirewallBak -and -not $Gui) {
     $Gui = $true
 }
 
@@ -1636,6 +2233,30 @@ try {
 
     if ($Status) {
         Write-Host (Get-StatusText)
+        exit 0
+    }
+
+    if ($ExportFirewallSnapshot) {
+        $r = Export-FirewallSnapshot
+        Write-Info ("Done. Rules captured: {0}" -f $r.RuleCount)
+        if ($Gui -and -not $WhatIfPreference) { Show-KillSwitchGui }
+        exit 0
+    }
+
+    if ($RestoreFirewallBak) {
+        Invoke-RestoreFirewallFromBak -Force:$Force
+        if ($Gui -and -not $WhatIfPreference) { Show-KillSwitchGui }
+        exit 0
+    }
+
+    if ($RetryTunnels) {
+        Ensure-AdministratorForMutation
+        if (-not (Test-IsKillSwitchArmed)) {
+            throw 'Retry tunnel allows requires the kill switch to be Armed.'
+        }
+        $n = Update-TunnelAllowRules
+        Write-Info ("Retry tunnel allows finished (added {0})." -f $n)
+        if ($Gui -and -not $WhatIfPreference) { Show-KillSwitchGui }
         exit 0
     }
 
