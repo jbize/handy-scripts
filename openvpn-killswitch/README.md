@@ -1,5 +1,7 @@
 # OpenVPN Kill Switch
 
+**Platform:** Windows
+
 Windows Firewall **Arm / Disarm** kill switch for [OpenVPN GUI](https://openvpn.net/community-downloads/).
 
 While **Armed**, outbound traffic is deny-by-default except:

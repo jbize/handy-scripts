@@ -1,5 +1,7 @@
 # Upgrade to Trixie
 
+**Platform:** Linux (Debian)
+
 Debian 12 (Bookworm) → Debian 13 (Trixie) upgrade helper.
 
 **Safety model:** fail closed. Default is preflight only. Live upgrade requires `--yes` (15s cold-feet pause; `--now` skips it).
