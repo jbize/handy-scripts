@@ -23,6 +23,12 @@ Thumbs.db
 *credentials*
 *api_keys*
 
+# TinyTuya wizard output (device local keys)
+tinytuya.json
+devices.json
+tuya-raw.json
+snapshot.json
+
 # Local Windows shortcuts (machine-specific paths)
 *.lnk
 

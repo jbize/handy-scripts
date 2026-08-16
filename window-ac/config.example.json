@@ -1,0 +1,30 @@
+{
+  "default_device": "master-bedroom",
+  "devices": [
+    {
+      "id": "master-bedroom",
+      "name": "Master Bedroom",
+      "brand": "hykolity",
+      "model": "ACB-2608",
+      "device_id": "",
+      "local_key": "",
+      "ip": "",
+      "version": 3.4,
+      "setpoint_min_f": 61,
+      "setpoint_max_f": 88,
+      "temp_scale": "auto",
+      "display_unit": "F",
+      "dps": {
+        "power": "1",
+        "set_temp": "2",
+        "cur_temp": "3",
+        "mode": "4",
+        "fan": "5",
+        "humidity": "18",
+        "temp_unit": "19",
+        "cur_temp_f": "23",
+        "set_temp_f": "24"
+      }
+    }
+  ]
+}

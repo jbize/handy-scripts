@@ -11,5 +11,6 @@ No installable package — clone the repo, or fetch a single file from raw GitHu
 | [billing-assistant](billing-assistant/) | Windows | Time tracking and email invoicing helper (Python `.pyw` + Excel). |
 | [upgrade-to-trixie](upgrade-to-trixie/) | Linux (Debian) | Debian 12 → 13 upgrade helper (bash). |
 | [openvpn-killswitch](openvpn-killswitch/) | Windows | Firewall Arm/Disarm kill switch for OpenVPN GUI (PowerShell + WinForms). |
+| [window-ac](window-ac/) | Windows | Click-to-open Smart Life / Tuya window AC panel (Python `.pyw`). |
 
 **Repo rules for Windows tools:** no binaries, no build/compile steps. Scripts only.
