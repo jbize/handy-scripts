@@ -20,6 +20,7 @@ Thumbs.db
 # Secrets / local junk
 *.pem
 *.key
+*.ppk
 *credentials*
 *api_keys*
 
