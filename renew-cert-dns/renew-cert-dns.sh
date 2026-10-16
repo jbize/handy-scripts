@@ -78,7 +78,6 @@ sudo chmod +x /etc/letsencrypt/dns-poll-hook.sh /etc/letsencrypt/dns-cleanup-rem
 # Run certbot with automatic DNS polling
 echo "Running certbot with automatic DNS polling..."
 sudo certbot certonly --manual --preferred-challenges=dns \
-    --manual-public-ip-logging-ok \
     --non-interactive \
     --cert-name "$DOMAIN" \
     --expand \
