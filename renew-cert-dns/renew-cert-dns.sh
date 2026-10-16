@@ -31,7 +31,7 @@ echo "Waiting for DNS propagation (checking every 5 seconds)..."
 echo ""
 
 # Poll DNS servers until record is visible
-MAX_ATTEMPTS=60  # 5 minutes max
+MAX_ATTEMPTS=180  # 15 minutes max
 ATTEMPT=0
 
 while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
@@ -79,7 +79,12 @@ sudo chmod +x /etc/letsencrypt/dns-poll-hook.sh /etc/letsencrypt/dns-cleanup-rem
 echo "Running certbot with automatic DNS polling..."
 sudo certbot certonly --manual --preferred-challenges=dns \
     --manual-public-ip-logging-ok \
-    -d "$DOMAIN" \
+    --non-interactive \
+    --cert-name "$DOMAIN" \
+    --expand \
+    -d fringes.godswind.org \
+    -d cameras.godswind.org \
+    -d games.godswind.org \
     --force-renewal \
     --manual-auth-hook /etc/letsencrypt/dns-poll-hook.sh \
     --manual-cleanup-hook /etc/letsencrypt/dns-cleanup-reminder.sh
