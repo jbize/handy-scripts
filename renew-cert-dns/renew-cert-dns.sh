@@ -53,7 +53,7 @@ while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
     sleep 5
 done
 
-echo "⚠ Warning: DNS record not found after $MAX_ATTEMPTS attempts (~5 minutes)."
+echo "⚠ Warning: DNS record not found after $MAX_ATTEMPTS attempts (~15 minutes)."
 echo "The record may still be propagating. Certbot will also verify."
 exit 0  # Continue anyway, certbot will do its own verification
 HOOKEOF
