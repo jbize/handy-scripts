@@ -13,5 +13,6 @@ No installable package — clone the repo, or fetch a single file from raw GitHu
 | [openvpn-killswitch](openvpn-killswitch/) | Windows | Firewall Arm/Disarm kill switch for OpenVPN GUI (PowerShell + WinForms). |
 | [window-ac](window-ac/) | Windows | Click-to-open Smart Life / Tuya window AC panel (Python `.pyw`). |
 | [putty-session-migrate](putty-session-migrate/) | Windows and Linux | Copy PuTTY saved sessions from the Windows registry into Linux `~/.putty` (Python 3). |
+| [renew-cert-dns](renew-cert-dns/) | Linux | Let's Encrypt renewal for `fringes.godswind.org` by a DNS TXT record (bash). |
 
 **Repo rules for Windows tools:** no binaries, no build/compile steps. Scripts only.
